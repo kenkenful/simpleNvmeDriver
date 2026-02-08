@@ -22,8 +22,6 @@ static dev_t nvme_chr_devt;   //major番号を動的に割り当てるために�
 #define QUEUE_DEPTH (32)   // Admin Queue とIO Queueのdepthは32とする。
 #define TIMEOUT (6*HZ)
 
-#define NUM_OF_IO_QUEUE_PAIR (4)  // IO Queueは、４つ用意する。
-
 // NVMeキューを管理する構造体
 struct nvme_queue{
     struct nvme_command *sq_cmds;           // SQのカーネル仮想アドレス
@@ -52,6 +50,12 @@ struct nvme_queue{
 
     dma_addr_t sq_dma_addr;    // SQの物理アドレス
 	dma_addr_t cq_dma_addr;    // CQの物理アドレス　
+
+    int command_id;
+
+    wait_queue_head_t wq;
+    int wait_condition;
+
 };
 
 // NVMeデバイスを管理する構造体
@@ -67,21 +71,12 @@ struct nvme_dev{
     unsigned long long mmio_base, mmio_flags, mmio_length;
     void __iomem *bar;
 
-    //unsigned int pio_memsize;
     struct nvme_queue *padminQ;
-    struct nvme_queue *pioQ[NUM_OF_IO_QUEUE_PAIR];
+    struct nvme_queue *pioQ;
 
+    struct dma_pool *cmd_pool;
 
-    // コマンド発行時はこのDMAバッファを使いまわす。
-    dma_addr_t prp1_dma_addr;   //物理アドレス   
-    void* prp1_virt_addr;     // 仮想アドレス
-
-    dma_addr_t prp2_dma_addr;   //物理アドレス   
-    void* prp2_virt_addr;     // 仮想アドレス
-
-    int wait_condition;
-    wait_queue_head_t sdma_q;
-    atomic_t event_done;
+    u32 db_stride;
 
 };
 
@@ -93,25 +88,99 @@ static struct pci_device_id test_nvme_ids[] =
 
 MODULE_DEVICE_TABLE(pci, test_nvme_ids);
 
+#if 0
 
-// 同期でコマンドを発行する関数
-static void submitCmd(struct nvme_command *c, struct nvme_queue *q){
+static int submitCmd(struct nvme_command *c, struct nvme_queue *q){
 
     spin_lock(&q->q_lock);
     u16 tail = q->sq_tail;
 
+    c->common.command_id = q->command_id++;
+
     struct nvme_dev *p = q->pnvme_dev;
+    q -> wait_condition = 0;
 
     memcpy(&q->sq_cmds[tail], c, sizeof(struct nvme_command));
     if (++tail == q->q_depth){
         tail = 0;
     }
-    writel(tail, p-> bar + NVME_REG_DBS + 8 * q->qid); //ドアベルレジスタを叩く
+    writel(tail, p-> bar + NVME_REG_DBS + 8 * q->qid); 
     q->sq_tail = tail;
 
     spin_unlock(&q->q_lock);
 
+    int left = wait_event_interruptible_timeout(q->wq, q->wait_condition == 1, msecs_to_jiffies(5000)); 
+
+    if (left > 0) return 0;
+    if (left == 0) return -ETIMEDOUT;
+    return left; 
 }
+#else 
+
+static inline void nvme_write_sq_db(struct nvme_dev *d, u16 qid, u16 tail)
+{
+    u32 stride = d->db_stride; /* 4 << DSTRD */
+    /* SQ doorbell index = 2*qid */
+    writel(tail, d->bar + NVME_REG_DBS + stride * (2 * qid));
+}
+
+static int submitCmd(struct nvme_command *c, struct nvme_queue *q)
+{
+    struct nvme_dev *dev = q->pnvme_dev;
+    u16 tail;
+    u16 mycid;
+    long left;
+
+    /* 並列を許さない前提でも、最低限の順序保証 */
+    WRITE_ONCE(q->wait_condition, 0);
+
+    spin_lock(&q->q_lock);
+
+    tail = q->sq_tail;
+
+    /* CID を発行（16bitで回るので u16 推奨） */
+    mycid = (u16)q->command_id++;
+    c->common.command_id = cpu_to_le16(mycid);
+
+    /* SQE をメモリに書く */
+    memcpy(&q->sq_cmds[tail], c, sizeof(*c));
+
+    /* デバイスが読む前に SQE 書き込みを完了させる */
+    wmb();
+
+    /* tail 更新 */
+    if (++tail == q->q_depth)
+        tail = 0;
+    q->sq_tail = tail;
+
+    /* ドアベルを叩く（DSTRD対応） */
+    nvme_write_sq_db(dev, q->qid, tail);
+
+    spin_unlock(&q->q_lock);
+
+    /*
+     * 完了待ち：
+     * いまの実装は「何か完了したら起きる」方式。
+     * 本当は CID で待つべきだが、まずは現状維持で安全化。
+     */
+    left = wait_event_interruptible_timeout(
+        q->wq,
+        READ_ONCE(q->wait_condition) == 1,
+        msecs_to_jiffies(5000)
+    );
+
+    if (left > 0)
+        return 0;
+    if (left == 0)
+        return -ETIMEDOUT;
+    return (int)left; /* -ERESTARTSYS 等 */
+}
+
+
+
+#endif
+
+
 
 static int nvmet_pci_open(struct inode* inode, struct file* filp){
     struct nvme_dev *pnvme_dev = container_of(inode->i_cdev, struct nvme_dev, cdev);
@@ -126,13 +195,16 @@ static int nvmet_pci_close(struct inode* inode, struct file* filp){
     return 0;
 }
 
-
-
 static long nvme_ioctl(struct file *filp, unsigned int ioctlnum, unsigned long ioctlparam){
     int rc = 0;
     struct nvme_command cmd = {0};
     struct nvme_dev *pnvme_dev = filp->private_data;
+    
+    void* virt_addr;
+    dma_addr_t dma_addr;
 
+    void __user *user_buf;
+    
     switch(ioctlnum){
         case IOCTL_IO_CMD:
             // ユーザー空間からカーネル空間にコマンドをコピー
@@ -140,29 +212,56 @@ static long nvme_ioctl(struct file *filp, unsigned int ioctlnum, unsigned long i
                 return rc;
             }
 
+            virt_addr = dma_pool_alloc(pnvme_dev->cmd_pool, GFP_ATOMIC, &dma_addr);
+
             // Writeのとき　ユーザー空間からカーネル空間にデーターバッファをコピー
-            if((rc = copy_from_user(pnvme_dev->prp1_virt_addr, (void  __user*)cmd.rw.dptr.prp1, 512))){
+            if((rc = copy_from_user(virt_addr, (void  __user*)cmd.rw.dptr.prp1, 4096))){
                 return rc;
             }
             
+            cmd.rw.dptr.prp1 = cpu_to_le64(dma_addr); 
+            submitCmd(&cmd, pnvme_dev->pioQ);
 
-            cmd.rw.dptr.prp1 = cpu_to_le64(pnvme_dev -> prp1_dma_addr); 
-            submitCmd(&cmd, pnvme_dev->pioQ[pnvme_dev->io_qid]);
-
-            if(++pnvme_dev->io_qid == NUM_OF_IO_QUEUE_PAIR)
-                pnvme_dev->io_qid = 0;
+            dma_pool_free(pnvme_dev->cmd_pool, virt_addr, dma_addr);
 
             break;
         
         case IOCTL_ADMIN_CMD:
+            
+            // ユーザー空間からカーネル空間にコマンドをコピー
             if((rc = copy_from_user(&cmd, (void  __user*)ioctlparam, sizeof(struct nvme_command)))){
                 return rc;
             }
 
-            cmd.rw.dptr.prp1 = cpu_to_le64(pnvme_dev ->prp1_dma_addr); 
-            submitCmd(&cmd, pnvme_dev->padminQ);
-            break;
+            user_buf = (void __user *)(uintptr_t)le64_to_cpu(cmd.common.dptr.prp1);
 
+            virt_addr = dma_pool_alloc(pnvme_dev->cmd_pool, GFP_ATOMIC, &dma_addr);
+
+            if (!virt_addr)
+                return -ENOMEM;
+
+            // Writeのとき　ユーザー空間からカーネル空間にデーターバッファをコピー
+            //if((rc = copy_from_user(virt_addr, (void  __user*)cmd.rw.dptr.prp1, 4096))){
+            //    return rc;
+            //}
+            
+            cmd.rw.dptr.prp1 = cpu_to_le64(dma_addr);
+
+            rc = submitCmd(&cmd, pnvme_dev->padminQ);
+
+            if(rc){
+                dma_pool_free(pnvme_dev->cmd_pool, virt_addr, dma_addr);
+                return rc;
+            }
+
+            if ((rc = copy_to_user(user_buf, virt_addr, 4096))) {
+                dma_pool_free(pnvme_dev->cmd_pool, virt_addr, dma_addr);
+                return rc;
+            }
+
+            dma_pool_free(pnvme_dev->cmd_pool, virt_addr, dma_addr);
+
+            break;
 
         default:
             break;
@@ -179,6 +278,7 @@ static const struct file_operations nvme_chr_fops = {
 };
 
 //割り込みハンドラ
+#if 0
 static irqreturn_t nvme_irq(int irq, void *data)
 {
     struct nvme_queue *nvmeq = data;
@@ -186,17 +286,17 @@ static irqreturn_t nvme_irq(int irq, void *data)
     u16 head, phase;
     head = nvmeq -> cq_head;     
     phase = nvmeq -> cq_phase;   
+
     rmb();
 
     while(1){
         cqe = nvmeq->cqes[head];  
      
-        // phase tagが期待値と一致しない場合は、loopを抜ける。 phase tagはstatusフィールドの最初のbitらしい。
         if((le16_to_cpu(cqe.status) & 1) != phase){
             break;  
         }
 
-        pr_info("Command id: 0x%x,  Status: 0x%x, phase tag %d, data[0] %x\n", le16_to_cpu(cqe.command_id), (le16_to_cpu(cqe.status) & 0xfe) >> 1, le16_to_cpu(cqe.status) & 1, *(unsigned char*)nvmeq->pnvme_dev->prp1_virt_addr);    
+        pr_info("Command id: 0x%x,  Status: 0x%x, phase tag %d\n", le16_to_cpu(cqe.command_id), (le16_to_cpu(cqe.status) & 0xfe) >> 1, le16_to_cpu(cqe.status) & 1);    
 
         nvmeq->sq_head = le16_to_cpu(cqe.sq_head);
         if(++head == nvmeq -> q_depth){
@@ -205,50 +305,92 @@ static irqreturn_t nvme_irq(int irq, void *data)
         }
    }
 
-    nvmeq->pnvme_dev->wait_condition = 1;
-    wake_up_interruptible(&nvmeq->pnvme_dev->sdma_q);    
+    nvmeq->wait_condition = 1;
+    wake_up_interruptible(&nvmeq->wq);    
 
     if (head == nvmeq->cq_head && phase == nvmeq->cq_phase)
 		return IRQ_NONE;
 
-	writel(head, nvmeq -> pnvme_dev-> bar + NVME_REG_DBS + 4 + 8 * nvmeq->qid);  // Admin CQのドアベルレジスタは、0x1004にある。
+	writel(head, nvmeq -> pnvme_dev-> bar + NVME_REG_DBS + pnvme_dev -> db_stride * (2 * nvmeq -> qid + 1) );  // Admin CQのドアベルレジスタは、0x1004にある。
 	nvmeq->cq_head = head;
 	nvmeq->cq_phase = phase;
+
     wmb();
 
     return  IRQ_HANDLED;
 }
+#else 
 
+static inline void nvme_write_cq_db(struct nvme_dev *d, u16 qid, u16 head)
+{
+    u32 stride = d->db_stride;                  // 4 << DSTRD
+    writel(head, d->bar + NVME_REG_DBS + stride * (2 * qid + 1));
+}
+
+static irqreturn_t nvme_irq(int irq, void *data)
+{
+    struct nvme_queue *nvmeq = data;
+    u16 head  = nvmeq->cq_head;
+    u16 phase = nvmeq->cq_phase;
+
+    dma_rmb();
+
+    while (1) {
+        struct nvme_completion cqe = nvmeq->cqes[head];
+
+        if ((le16_to_cpu(cqe.status) & 1) != phase)
+            break;
+
+        nvmeq->sq_head = le16_to_cpu(cqe.sq_head);
+
+        if (++head == nvmeq->q_depth) {
+            head = 0;
+            phase = !phase;
+        }
+    }
+
+    if (head == nvmeq->cq_head && phase == nvmeq->cq_phase)
+        return IRQ_NONE;
+
+    /* CQ head をデバイスへ通知 */
+    nvme_write_cq_db(nvmeq->pnvme_dev, nvmeq->qid, head);
+
+    nvmeq->cq_head  = head;
+    nvmeq->cq_phase = phase;
+
+    WRITE_ONCE(nvmeq->wait_condition, 1);
+    smp_wmb();
+    wake_up_interruptible(&nvmeq->wq);
+
+    return IRQ_HANDLED;
+}
+
+#endif
 
 static int nvmet_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id){
     u32 ctrl_config = 0;
-    //int alloc_ret = 0;
-    //int cdev_err = 0;
-    //short vendor_id, device_id, class, sub_vendor_id, sub_device_id;
+    
     u32 aqa;
     u32 csts;
     unsigned long timeout;
     int ret = -ENOMEM;
-    //int major, minor;
-    //int result;
-    int index;
-    int bad_index;
 
     struct nvme_dev *pnvme_dev;
     struct nvme_queue *padminQ;       // Admin Queue管理構造体へのポインタ  
-    struct nvme_queue *pioQ[NUM_OF_IO_QUEUE_PAIR];          // IO Queue管理構造体へのポインタを一つだけ作成する。
+    struct nvme_queue *pioQ;          // IO Queue管理構造体へのポインタを一つだけ作成する。
 
     // Allocate device structure
     pnvme_dev = kmalloc(sizeof(struct nvme_dev), GFP_KERNEL);
     if(!pnvme_dev){
-        goto out_alloc_pnvme_dev;
+        return -ENOMEM;
     }
 
     pnvme_dev->io_qid = 0;
 
     ret = ida_simple_get(&nvme_instance_ida, 0, 0, GFP_KERNEL);
     if (ret < 0){
-        goto out_ida_simple_get;
+        kfree(pnvme_dev);
+        return ret;
     }
 		
     pnvme_dev -> instance = ret;
@@ -260,83 +402,322 @@ static int nvmet_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
     // キャラクタデバイス作成
     if ((ret = cdev_add(&pnvme_dev->cdev, pnvme_dev -> devt , NVME_MINORS)) != 0) {
-        goto out_cdev_add;
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return ret;
     }
 
-    device_create(nvme_class, NULL, MKDEV(MAJOR(nvme_chr_devt), pnvme_dev -> instance), NULL, "nvmet%d", pnvme_dev -> instance);
+    struct device *dev = device_create(nvme_class, NULL, MKDEV(MAJOR(nvme_chr_devt), pnvme_dev -> instance), NULL, "nvmet%d", pnvme_dev -> instance);
     
-    // Device has only Memory mapped space, so pci_enable_device_mem is used.
-    if (pci_enable_device_mem(pdev)){
-        ret = -ENOMEM; 
-        goto out_pci_enable_device;
+    if (IS_ERR(dev)) {
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return PTR_ERR(dev);   
+    }
+
+    ret = pci_enable_device_mem(pdev); 
+    if (ret){
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return ret;
     }
 		
-    pci_set_master(pdev);
+    ret = pci_request_mem_regions(pdev, DEVICE_NAME);
 
-    if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64)) && dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32))){
-        ret = -ENOMEM;
-        goto out_dma_set_mask_and_coherent;
+    if(ret) {
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+
+        return ret;
     }
+
+    // デバイスからpdevを参照できるようにする
+    pnvme_dev->pdev = pci_dev_get(pdev);
+
+    // pdevからデバイスを参照できるようにする
+	pci_set_drvdata(pdev, pnvme_dev);
+
+
+    ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+    if (ret) {
+        ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+        if (ret){
+            pci_release_mem_regions(pdev);
+            pci_disable_device(pdev);
+            device_destroy(nvme_class, pnvme_dev -> devt );
+            cdev_del(&pnvme_dev->cdev); 
+            ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+            kfree(pnvme_dev);
+            return ret;
+        }
+    }
+
+    pci_set_master(pdev);
 
     // Admin Queue管理構造体の作成
     padminQ = kmalloc(sizeof(struct nvme_queue), GFP_KERNEL);
     if(!padminQ){
-        ret = -ENOMEM;
-        goto out_alloc_adminQ;
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return -ENOMEM;
     }
+
+    // デバイスからQueueを参照できるようにする
     pnvme_dev->padminQ = padminQ;
+    
+    // Queueからデバイスを参照できるようにする
     padminQ->pnvme_dev = pnvme_dev;
 
+    //Admin Queue管理構造体の変数初期化
+    spin_lock_init(&padminQ->q_lock);
+    padminQ->sq_tail = 0;
+    padminQ->cq_head = 0;
+	padminQ->cq_phase = 1;    //デフォルトのphase tagは１。
+    padminQ->q_depth = QUEUE_DEPTH;
+	padminQ->qid = 0;
+	padminQ->cq_vector = padminQ->qid;
+    padminQ -> command_id = 0;
+
+    //memset((void *)padminQ->cqes, 0, CQ_SIZE(QUEUE_DEPTH)); 
+
     //  IO Queue管理構造体の作成
-    for(index = 0; index < NUM_OF_IO_QUEUE_PAIR; ++index){
-        pioQ[index] = kmalloc(sizeof(struct nvme_queue), GFP_KERNEL);
-        if(!pioQ[index]){
-            ret = -ENOMEM;
-            goto out_alloc_pioQ;
-        }
-            pnvme_dev->pioQ[index] = pioQ[index];
-            pioQ[index]->pnvme_dev = pnvme_dev;
+    pioQ = kmalloc(sizeof(struct nvme_queue), GFP_KERNEL);
+    if(!pioQ){
+        kfree(padminQ);
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return -ENOMEM;
+    }
+    
+    // デバイスからQueueを参照できるようにする
+    pnvme_dev->pioQ = pioQ;
+
+    // Queueからデバイスを参照できるようにする
+    pioQ->pnvme_dev = pnvme_dev;
+
+    //IO Queue管理構造体の変数初期化
+    spin_lock_init(&pioQ->q_lock);
+    pioQ -> sq_tail = 0;
+    pioQ -> cq_head = 0;
+    pioQ -> cq_phase = 1;    //デフォルトのphase tagは１です。
+    pioQ -> q_depth = QUEUE_DEPTH;
+    pioQ -> qid = 1;
+    pioQ -> cq_vector = pioQ->qid;
+    pioQ -> command_id = 0;
+
+    // Admin CQ用のDMAメモリを確保
+    padminQ->cqes = dma_alloc_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), &padminQ->cq_dma_addr, GFP_KERNEL);
+    if(padminQ->cqes == NULL){
+        kfree(pioQ);
+        kfree(padminQ);
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return -ENOMEM;
     }
 
-    ret = pci_request_regions(pdev, DEVICE_NAME);
+    memset((void *)padminQ->cqes, 0, CQ_SIZE(QUEUE_DEPTH)); 
 
-    if(ret) {
-        goto out_pci_request_regions;
+    // Admin SQ用のDMAメモリを確保
+    padminQ->sq_cmds = dma_alloc_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), &padminQ->sq_dma_addr, GFP_KERNEL);
+    if(padminQ->sq_cmds == NULL){
+
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+        kfree(pnvme_dev ->pioQ);
+        kfree(pnvme_dev ->padminQ);
+
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return -ENOMEM;
     }
 
-    pnvme_dev->pdev = pci_dev_get(pdev);
-	pci_set_drvdata(pdev, pnvme_dev);
+    memset((void *)padminQ->sq_cmds , 0, SQ_SIZE(QUEUE_DEPTH));
+
+
+// IO CQ用のDMAメモリを作成
+    pioQ->cqes = dma_alloc_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), &pioQ->cq_dma_addr, GFP_KERNEL);
+    if(pioQ->cqes == NULL){
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+        kfree(pnvme_dev ->pioQ);
+        kfree(pnvme_dev ->padminQ);
+
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return -ENOMEM;
+    }
+
+    memset((void *)pioQ->cqes, 0, CQ_SIZE(QUEUE_DEPTH)); 
+
+
+    // IO SQ用のDMAメモリを作成
+    pioQ->sq_cmds = dma_alloc_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), &pioQ->sq_dma_addr, GFP_KERNEL);
+    if(pioQ->sq_cmds == NULL){
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+        kfree(pnvme_dev ->pioQ);
+        kfree(pnvme_dev ->padminQ);
+
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return -ENOMEM;
+    }
+
+    memset((void *)pioQ->sq_cmds , 0, SQ_SIZE(QUEUE_DEPTH));
+
 
     // BAR0の物理アドレスを長さを取得
     pnvme_dev->mmio_base = pci_resource_start(pdev, 0);
     pnvme_dev->mmio_length = pci_resource_len(pdev, 0);
     pnvme_dev->mmio_flags = pci_resource_flags(pdev, 0);
-    pr_info( "mmio_base: 0x%llx, mmio_length: 0x%llx, mmio_flags: 0x%llx\n",pnvme_dev->mmio_base, pnvme_dev->mmio_length, pnvme_dev->mmio_flags);
+    dev_info(&pdev->dev, "mmio_base: 0x%llx, mmio_length: 0x%llx, mmio_flags: 0x%llx\n",pnvme_dev->mmio_base, pnvme_dev->mmio_length, pnvme_dev->mmio_flags);
 
     // BAR0をカーネル仮想アドレスにマッピングする。
     pnvme_dev->bar = ioremap(pnvme_dev->mmio_base, pnvme_dev->mmio_length);
 
-    // Admin CQとIO CQ用に割り込みベクターは(NUM_OF_IO_QUEUE_PAIR + 1)個確保する。
-    int nr_io_queues = pci_alloc_irq_vectors(pdev, 1, NUM_OF_IO_QUEUE_PAIR + 1, PCI_IRQ_ALL_TYPES | PCI_IRQ_AFFINITY);
-    //int	error = pci_enable_msi(pdev);
+    if(!pnvme_dev->bar){
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->sq_cmds, pnvme_dev ->pioQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
 
-    if (nr_io_queues != (NUM_OF_IO_QUEUE_PAIR + 1)) {
-        ret = -ENOMEM;
-        goto out_pci_alloc_irq_vectors;
-	}
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+        kfree(pnvme_dev ->pioQ);
+        kfree(pnvme_dev ->padminQ);
+
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return -ENOMEM;
+
+    }
+
+    // Admin CQとIO CQ用にMSI-X 割り込みベクターは(1 + 1)個確保する。
+    int nr_io_queues = pci_alloc_irq_vectors(pdev, 1, 2, PCI_IRQ_MSIX);
+
+    if (nr_io_queues < 0) {
+        iounmap(pnvme_dev->bar);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->sq_cmds, pnvme_dev ->pioQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+        kfree(pnvme_dev ->pioQ);
+        kfree(pnvme_dev ->padminQ);
+
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+
+        return nr_io_queues;
+    }
 
     pr_info( "nr io queues: %d\n", nr_io_queues);
 
-    if (readl(pnvme_dev->bar + NVME_REG_VS) == NVME_VS(1, 2, 0)){
-        pr_info( "NVMe version : 1.2\n");
-    }else if(readl(pnvme_dev->bar + NVME_REG_VS) == NVME_VS(1, 3, 0)){
-        pr_info( "NVMe version : 1.3\n");
-    }else{
-        pr_info( "NVMe version :unknown \n");
-    }
+    ret = request_irq(
+        pci_irq_vector(pdev, 0), 
+        nvme_irq, 0, "adminQ", padminQ);
 
-    u32 cap = lo_hi_readq(pnvme_dev->bar + NVME_REG_CAP);
-    pr_info("Doorbell Stride :%d\n", NVME_CAP_STRIDE(cap));
+    if (ret){
+        pci_free_irq_vectors(pdev);
+
+        iounmap(pnvme_dev->bar);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->sq_cmds, pnvme_dev ->pioQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+        kfree(pnvme_dev ->pioQ);
+        kfree(pnvme_dev ->padminQ);
+
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+        return ret;
+    }   
+
+    ret = request_irq(
+        pci_irq_vector(pdev, 1),
+        nvme_irq, 0, "ioQ", pioQ);
+
+    if (ret){
+
+        free_irq(pci_irq_vector(pdev, 0), pnvme_dev ->padminQ);
+
+        pci_free_irq_vectors(pdev);
+
+        iounmap(pnvme_dev->bar);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->sq_cmds, pnvme_dev ->pioQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+        kfree(pnvme_dev ->pioQ);
+        kfree(pnvme_dev ->padminQ);
+
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+
+        return ret;
+    }   
+
+    u64 cap = lo_hi_readq(pnvme_dev->bar + NVME_REG_CAP);
+    pnvme_dev->db_stride = 4U << NVME_CAP_STRIDE(cap); 
+    //pr_info("Doorbell Stride :%d\n", NVME_CAP_STRIDE(cap));
 
     // disable device
     ctrl_config = 0;
@@ -348,40 +729,39 @@ static int nvmet_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
     //Controller not ready になるまで待つ 
     while((readl(pnvme_dev->bar + NVME_REG_CSTS) & NVME_CSTS_RDY) != 0){
-        pr_info("now ready. waiting...\n");
+        dev_info(&pdev->dev, "now ready. waiting...\n");
         msleep(100);
         if (time_after(jiffies, timeout)) {
-            ret = -ENODEV;
-            goto out_wait_not_ready_timeout;
+
+            free_irq(pci_irq_vector(pdev, 1), pnvme_dev ->pioQ);
+            free_irq(pci_irq_vector(pdev, 0), pnvme_dev ->padminQ);
+
+            pci_free_irq_vectors(pdev);
+
+            iounmap(pnvme_dev->bar);
+
+            dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->sq_cmds, pnvme_dev ->pioQ->sq_dma_addr);
+            dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
+
+            dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+            dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+            kfree(pnvme_dev ->pioQ);
+            kfree(pnvme_dev ->padminQ);
+
+            pci_release_mem_regions(pdev);
+            pci_disable_device(pdev);
+            device_destroy(nvme_class, pnvme_dev -> devt );
+            cdev_del(&pnvme_dev->cdev); 
+            ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+            kfree(pnvme_dev);
+            return -ENODEV;
+
 		}
     }
 
     csts = readl(pnvme_dev->bar + NVME_REG_CSTS);
-    pr_info("csts rdy : %d\n", csts & NVME_CSTS_RDY);
-
-    // Admin CQ用のDMAメモリを確保
-    padminQ->cqes = dma_alloc_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), &padminQ->cq_dma_addr, GFP_KERNEL);
-    if(padminQ->cqes == NULL){
-         ret = -ENOMEM;
-        goto out_alloc_adminCQ;
-    }
-
-    // Admin SQ用のDMAメモリを確保
-    padminQ->sq_cmds = dma_alloc_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), &padminQ->sq_dma_addr, GFP_KERNEL);
-    if(padminQ->sq_cmds == NULL){
-        ret = -ENOMEM;
-        goto out_alloc_adminSQ;
-    }
-
-    //Admin Queue管理構造体の変数初期化
-    spin_lock_init(&padminQ->q_lock);
-    padminQ->sq_tail = 0;
-    padminQ->cq_head = 0;
-	padminQ->cq_phase = 1;    //デフォルトのphase tagは１。
-    padminQ->q_depth = QUEUE_DEPTH;
-	padminQ->qid = 0;
-	padminQ->cq_vector = padminQ->qid;
-    memset((void *)padminQ->cqes, 0, CQ_SIZE(QUEUE_DEPTH)); 
+    dev_info(&pdev->dev, "csts rdy : %d\n", csts & NVME_CSTS_RDY);
 
     //  コントローラのレジスタを設定する。
     aqa = padminQ->q_depth - 1;
@@ -390,40 +770,10 @@ static int nvmet_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     lo_hi_writeq(padminQ-> sq_dma_addr, pnvme_dev->bar + NVME_REG_ASQ); // Admin Submission Queue Base Address を設定
 	lo_hi_writeq(padminQ-> cq_dma_addr, pnvme_dev->bar + NVME_REG_ACQ); // Admin Completion Queue Base Address を設定
 
-    unsigned dev_page_min = NVME_CAP_MPSMIN(cap) + 12;
-    pr_info( "Minimum device page size %u\n", 1 << dev_page_min);
+    //unsigned dev_page_min = NVME_CAP_MPSMIN(cap) + 12;
+    //pr_info( "Minimum device page size %u\n", 1 << dev_page_min);
 
-    for(index = 0; index < NUM_OF_IO_QUEUE_PAIR; ++index){
-        // IO CQ用のDMAメモリを作成
-        pioQ[index]->cqes = dma_alloc_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), &pioQ[index]->cq_dma_addr, GFP_KERNEL);
-
-        if(pioQ[index]->cqes == NULL){
-            ret = -ENOMEM;
-            bad_index = index;
-            goto out_alloc_ioCQ;
-        }
-
-        // IO SQ用のDMAメモリを作成
-        pioQ[index]->sq_cmds = dma_alloc_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), &pioQ[index]->sq_dma_addr, GFP_KERNEL);
-
-        if(pioQ[index]->sq_cmds == NULL){
-            ret = -ENOMEM;
-            bad_index = index;
-            goto out_alloc_ioSQ;
-        }
-
-        //IO Queue管理構造体の変数初期化
-        spin_lock_init(&pioQ[index]->q_lock);
-        pioQ[index]->sq_tail = 0;
-        pioQ[index]->cq_head = 0;
-        pioQ[index]->cq_phase = 1;    //デフォルトのphase tagは１です。
-        pioQ[index]->q_depth = QUEUE_DEPTH;
-        pioQ[index]->qid = index + 1;
-        pioQ[index]->cq_vector = pioQ[index]->qid;
-        memset((void *)pioQ[index]->cqes, 0, CQ_SIZE(QUEUE_DEPTH));
-    }
-
-    //　コントローラレジスタの設定
+    
     unsigned page_shift = 12;
     ctrl_config = NVME_CC_CSS_NVM;
 	ctrl_config |= (page_shift - 12) << NVME_CC_MPS_SHIFT;
@@ -440,169 +790,186 @@ static int nvmet_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         pr_info("Polling until ready\n");
         msleep(100);
         if (time_after(jiffies, timeout)) {
-            ret = -ENODEV;
-            goto out_wait_ready_timeout;
+
+            free_irq(pci_irq_vector(pdev, 1), pnvme_dev ->pioQ);
+            free_irq(pci_irq_vector(pdev, 0), pnvme_dev ->padminQ);
+
+            pci_free_irq_vectors(pdev);
+
+            iounmap(pnvme_dev->bar);
+
+            dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->sq_cmds, pnvme_dev ->pioQ->sq_dma_addr);
+            dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
+
+            dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+            dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+            kfree(pnvme_dev ->pioQ);
+            kfree(pnvme_dev ->padminQ);
+
+            pci_release_mem_regions(pdev);
+            pci_disable_device(pdev);
+            device_destroy(nvme_class, pnvme_dev -> devt );
+            cdev_del(&pnvme_dev->cdev); 
+            ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+            kfree(pnvme_dev);
+            return -ENODEV;
+
 		}
     }
 
-    pr_info("csts rdy : %d\n", readl(pnvme_dev->bar + NVME_REG_CSTS) & NVME_CSTS_RDY);
+    dev_info(&pdev->dev, "csts rdy : %d\n", readl(pnvme_dev->bar + NVME_REG_CSTS) & NVME_CSTS_RDY);
 
-    // PRP1用のDMAメモリを確保
-    pnvme_dev ->prp1_virt_addr = dma_alloc_coherent(&pdev->dev, 4096, &pnvme_dev->prp1_dma_addr, GFP_KERNEL);
-    if(pnvme_dev ->prp1_virt_addr == NULL){
-        ret = -ENOMEM;
-        goto out_alloc_data_buffer;
-    }
-
-    // PRP2用のDMAメモリを確保
-    pnvme_dev ->prp2_virt_addr = dma_alloc_coherent(&pdev->dev, 4096, &pnvme_dev->prp2_dma_addr, GFP_KERNEL);
-    if(pnvme_dev ->prp2_virt_addr == NULL){
-        ret = -ENOMEM;
-        goto out_alloc_data_buffer;
-    }
-
-    //Admin CQ用の割り込みハンドラーの設定 
-    ret = pci_request_irq(pdev, padminQ->cq_vector, nvme_irq, NULL, padminQ, "nvme%dadminq%d", pnvme_dev->instance, padminQ->qid);
-    if(ret < 0){
-        goto out_pci_request_irq_admin;
-    }
 
     // wait queueの初期化
-    init_waitqueue_head(&pnvme_dev->sdma_q);
+    init_waitqueue_head(&padminQ->wq);
+    init_waitqueue_head(&pioQ->wq);
 
   	struct nvme_command cmd = {0};
     
-    for(index = 0; index < NUM_OF_IO_QUEUE_PAIR; ++index){
-        // Create IO CQコマンドを作成する。
-        int flags = NVME_QUEUE_PHYS_CONTIG | NVME_CQ_IRQ_ENABLED;
-        memset(&cmd, 0, sizeof(cmd));
-        cmd.create_cq.opcode = nvme_admin_create_cq;
-        cmd.create_cq.prp1 = cpu_to_le64(pioQ[index]->cq_dma_addr);
-        cmd.create_cq.cqid = cpu_to_le16(pioQ[index]->qid);
-        cmd.create_cq.qsize = cpu_to_le16(pioQ[index]->q_depth - 1);
-        cmd.create_cq.cq_flags = cpu_to_le16(flags);
-        cmd.create_cq.irq_vector = cpu_to_le16(pioQ[index]->cq_vector);
-        cmd.create_cq.command_id = 0;
-        // Create IO CQコマンドを発行する。
-        submitCmd(&cmd, padminQ);
-
-        // Create IO SQコマンドを作成する。
-        flags = NVME_QUEUE_PHYS_CONTIG;
-        memset(&cmd, 0, sizeof(cmd));
-        cmd.create_sq.opcode = nvme_admin_create_sq;
-        cmd.create_sq.prp1 = cpu_to_le64(pioQ[index]->sq_dma_addr);
-        cmd.create_sq.sqid = cpu_to_le16(pioQ[index]->qid);
-        cmd.create_sq.qsize = cpu_to_le16(pioQ[index]->q_depth - 1);
-        cmd.create_sq.sq_flags = cpu_to_le16(flags);
-        cmd.create_sq.cqid = cpu_to_le16(pioQ[index]->qid);
-        cmd.create_sq.command_id = 1;
-
-        // Create IO SQコマンドを発行する。
-        submitCmd(&cmd, padminQ);
+    // Create IO CQコマンドを作成する。
+    int flags = NVME_QUEUE_PHYS_CONTIG | NVME_CQ_IRQ_ENABLED;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.create_cq.opcode = nvme_admin_create_cq;
+    cmd.create_cq.prp1 = cpu_to_le64(pioQ->cq_dma_addr);
+    cmd.create_cq.cqid = cpu_to_le16(pioQ->qid);
+    cmd.create_cq.qsize = cpu_to_le16(pioQ->q_depth - 1);
+    cmd.create_cq.cq_flags = cpu_to_le16(flags);
+    cmd.create_cq.irq_vector = cpu_to_le16(pioQ->cq_vector);
     
-        msleep(100);
+    // Create IO CQコマンドを発行する。
+    ret = submitCmd(&cmd, padminQ);
 
-        //　IO CQ用の割り込みハンドラーを設定する
-        ret = pci_request_irq(pdev, pioQ[index]->cq_vector, nvme_irq, NULL, pioQ[index], "nvme%dioq%d", pnvme_dev->instance, pioQ[index]->qid);
-        if(ret < 0){
-            bad_index = index;
-            goto out_pci_request_irq_io;
-        }
+    if(ret){
+		dev_err(&pdev->dev, "Command submit failed\n");
+
+        free_irq(pci_irq_vector(pdev, 1), pnvme_dev ->pioQ);
+        free_irq(pci_irq_vector(pdev, 0), pnvme_dev ->padminQ);
+
+        pci_free_irq_vectors(pdev);
+
+        iounmap(pnvme_dev->bar);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->sq_cmds, pnvme_dev ->pioQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+        kfree(pnvme_dev ->pioQ);
+        kfree(pnvme_dev ->padminQ);
+
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+
+    }
+    
+    // Create IO SQコマンドを作成する。
+    flags = NVME_QUEUE_PHYS_CONTIG;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.create_sq.opcode = nvme_admin_create_sq;
+    cmd.create_sq.prp1 = cpu_to_le64(pioQ->sq_dma_addr);
+    cmd.create_sq.sqid = cpu_to_le16(pioQ->qid);
+    cmd.create_sq.qsize = cpu_to_le16(pioQ->q_depth - 1);
+    cmd.create_sq.sq_flags = cpu_to_le16(flags);
+    cmd.create_sq.cqid = cpu_to_le16(pioQ->qid);
+    
+    // Create IO SQコマンドを発行する。
+    ret = submitCmd(&cmd, padminQ);
+
+    if(ret){
+
+		dev_err(&pdev->dev, "Command submit failed\n");
+
+        //Delete CQコマンドを発行する
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.delete_queue.opcode = nvme_admin_delete_cq;
+	    cmd.delete_queue.qid = cpu_to_le16(pnvme_dev->pioQ->qid);
+        submitCmd(&cmd, pnvme_dev->padminQ);
+
+        free_irq(pci_irq_vector(pdev, 1), pnvme_dev ->pioQ);
+        free_irq(pci_irq_vector(pdev, 0), pnvme_dev ->padminQ);
+
+        pci_free_irq_vectors(pdev);
+
+        iounmap(pnvme_dev->bar);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->sq_cmds, pnvme_dev ->pioQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
+
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+        kfree(pnvme_dev ->pioQ);
+        kfree(pnvme_dev ->padminQ);
+
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
+
     }
 
-    return 0;
+    msleep(100);
 
-out_pci_request_irq_io:
-    for(index = 0; index <= bad_index; ++index){
+    pnvme_dev ->cmd_pool = dma_pool_create(
+		"cmd_pool",
+		&pdev->dev,
+		4096,
+		4096,   
+		0     
+	);
+
+
+    if (!pnvme_dev->cmd_pool) {
+		dev_err(&pdev->dev, "dma_pool_create failed\n");
+
         //Delete SQコマンドを発行する
         memset(&cmd, 0, sizeof(cmd));
         cmd.delete_queue.opcode = nvme_admin_delete_sq;
-	    cmd.delete_queue.qid = cpu_to_le16(pnvme_dev->pioQ[index]->qid);
-        cmd.delete_queue.command_id = 5;
+	    cmd.delete_queue.qid = cpu_to_le16(pnvme_dev->pioQ->qid);
         submitCmd(&cmd, pnvme_dev->padminQ);
 
         //Delete CQコマンドを発行する
         memset(&cmd, 0, sizeof(cmd));
         cmd.delete_queue.opcode = nvme_admin_delete_cq;
-	    cmd.delete_queue.qid = cpu_to_le16(pnvme_dev->pioQ[index]->qid);
-        cmd.delete_queue.command_id = 6;  
+	    cmd.delete_queue.qid = cpu_to_le16(pnvme_dev->pioQ->qid);
         submitCmd(&cmd, pnvme_dev->padminQ);
 
-    }
+        free_irq(pci_irq_vector(pdev, 1), pnvme_dev ->pioQ);
+        free_irq(pci_irq_vector(pdev, 0), pnvme_dev ->padminQ);
 
-    // IO CQ用の割り込みの後始末
-    for(index = 0; index < bad_index; ++index){
-        pci_free_irq(pdev, padminQ->cq_vector, pnvme_dev->pioQ[index]);
-    }
+        pci_free_irq_vectors(pdev);
 
-    // Admin CQ用の割り込みの後始末
-    pci_free_irq(pdev, padminQ->cq_vector, pnvme_dev->padminQ);
+        iounmap(pnvme_dev->bar);
 
-out_pci_request_irq_admin:
-    //dma_pool_destroy(pnvme_dev->prp_page_pool);   
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->sq_cmds, pnvme_dev ->pioQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
 
-//out_create_dma_pool_later:
- //   dma_pool_destroy(pnvme_dev->prp_page_pool_first);
+        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
 
-out_create_dma_pool:
-    dma_free_coherent(&pnvme_dev->pdev->dev, 4096, (void *)pnvme_dev->prp2_virt_addr, pnvme_dev ->prp2_dma_addr);
+        kfree(pnvme_dev ->pioQ);
+        kfree(pnvme_dev ->padminQ);
 
+        pci_release_mem_regions(pdev);
+        pci_disable_device(pdev);
+        device_destroy(nvme_class, pnvme_dev -> devt );
+        cdev_del(&pnvme_dev->cdev); 
+        ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
+        kfree(pnvme_dev);
 
-    dma_free_coherent(&pnvme_dev->pdev->dev, 4096, (void *)pnvme_dev->prp1_virt_addr, pnvme_dev ->prp1_dma_addr);
+		return -ENOMEM;
+	}
+    
+    return 0;
 
-out_wait_ready_timeout:
-out_alloc_data_buffer:
-    for(index = 0; index < bad_index; ++index){
-        dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pioQ[index]->sq_cmds, pioQ[index]->sq_dma_addr);
-    }
-
-out_alloc_ioSQ:
-    for(index = 0; index < bad_index; ++index){
-        dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pioQ[index]->cqes, pioQ[index]->cq_dma_addr);
-    }
-
-out_alloc_ioCQ:
-    dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)padminQ->sq_cmds, padminQ->sq_dma_addr);
-
-out_alloc_adminSQ:
-    dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)padminQ->cqes, padminQ->cq_dma_addr);
-
-out_wait_not_ready_timeout:
-out_alloc_adminCQ:
-    pci_free_irq_vectors(pdev);
-
-out_pci_alloc_irq_vectors:
-	iounmap(pnvme_dev->bar);
-
-out_ioremap:
-    pci_set_drvdata(pdev, NULL);
-
-out_pci_set_drvdata:
-	pci_release_regions(pdev);
-
-out_pci_request_regions:
-    kfree(pioQ);
-
-out_alloc_pioQ:
-    kfree(padminQ);
-
-out_dma_set_mask_and_coherent:
-out_alloc_adminQ:
-    pci_disable_device(pdev);
-
-out_pci_enable_device:
-    device_destroy(nvme_class, pnvme_dev -> devt );
-
-out_cdev_add:
-    cdev_del(&pnvme_dev->cdev); 
-    ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
-
-out_ida_simple_get:
-    kfree(pnvme_dev);
-
-out_alloc_pnvme_dev:
-
-    return ret;
 }
 
 static void nvmet_pci_remove(struct pci_dev* pdev){
@@ -610,62 +977,46 @@ static void nvmet_pci_remove(struct pci_dev* pdev){
     struct nvme_command cmd = {0};
     struct nvme_dev *pnvme_dev = pci_get_drvdata(pdev);
 
-    int index = 0;
-    for(index = 0; index < NUM_OF_IO_QUEUE_PAIR; ++index){
-        pci_free_irq(pdev, pnvme_dev->pioQ[index]->cq_vector, pnvme_dev ->pioQ[index]);
-    
-        //Delete SQコマンドを発行する
-        memset(&cmd, 0, sizeof(cmd));
-        cmd.delete_queue.opcode = nvme_admin_delete_sq;
-	    cmd.delete_queue.qid = cpu_to_le16(pnvme_dev->pioQ[index]->qid);
-        cmd.delete_queue.command_id = 5;
-        submitCmd(&cmd, pnvme_dev->padminQ);
+    if (pnvme_dev->cmd_pool) dma_pool_destroy(pnvme_dev->cmd_pool);
 
-        //Delete CQコマンドを発行する
-        memset(&cmd, 0, sizeof(cmd));
-        cmd.delete_queue.opcode = nvme_admin_delete_cq;
-	    cmd.delete_queue.qid = cpu_to_le16(pnvme_dev->pioQ[index]->qid);
-        cmd.delete_queue.command_id = 6;  
-        submitCmd(&cmd, pnvme_dev->padminQ);
-    }
-    
-    pci_free_irq(pdev, pnvme_dev->padminQ->cq_vector, pnvme_dev ->padminQ);
+    //Delete SQコマンドを発行する
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.delete_queue.opcode = nvme_admin_delete_sq;
+	cmd.delete_queue.qid = cpu_to_le16(pnvme_dev->pioQ->qid);
+    submitCmd(&cmd, pnvme_dev->padminQ);
 
-   // dma_pool_destroy(pnvme_dev->prp_page_pool);   
-   // dma_pool_destroy(pnvme_dev->prp_page_pool_first);
-
-    dma_free_coherent(&pnvme_dev->pdev->dev, sizeof(struct nvme_id_ctrl), (void *)pnvme_dev->prp2_virt_addr, pnvme_dev ->prp2_dma_addr);
-
-    dma_free_coherent(&pnvme_dev->pdev->dev, sizeof(struct nvme_id_ctrl), (void *)pnvme_dev->prp1_virt_addr, pnvme_dev ->prp1_dma_addr);
+    //Delete CQコマンドを発行する
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.delete_queue.opcode = nvme_admin_delete_cq;
+	cmd.delete_queue.qid = cpu_to_le16(pnvme_dev->pioQ->qid);
+    submitCmd(&cmd, pnvme_dev->padminQ);
 
 
-    for(index = 0; index < NUM_OF_IO_QUEUE_PAIR; ++index){
-        dma_free_coherent(&pnvme_dev->pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev->pioQ[index]->sq_cmds, pnvme_dev ->pioQ[index]->sq_dma_addr);
-        dma_free_coherent(&pnvme_dev->pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev->pioQ[index]->cqes, pnvme_dev ->pioQ[index]->cq_dma_addr);
-    }
+    free_irq(pci_irq_vector(pdev, 1), pnvme_dev ->pioQ);
+    free_irq(pci_irq_vector(pdev, 0), pnvme_dev ->padminQ);
 
-    dma_free_coherent(&pnvme_dev->pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
-    dma_free_coherent(&pnvme_dev->pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
     pci_free_irq_vectors(pdev);
-	iounmap(pnvme_dev->bar);
-    pci_set_drvdata(pdev, NULL);
-	pci_release_regions(pdev);
 
-    for(index = 0; index < NUM_OF_IO_QUEUE_PAIR; ++index){
-        kfree(pnvme_dev->pioQ[index]);
-    }
+    iounmap(pnvme_dev->bar);
 
-    kfree(pnvme_dev->padminQ);
+    dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->sq_cmds, pnvme_dev ->pioQ->sq_dma_addr);
+    dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->pioQ->cqes, pnvme_dev ->pioQ->cq_dma_addr);
+
+    dma_free_coherent(&pdev->dev, SQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->sq_cmds, pnvme_dev ->padminQ->sq_dma_addr);
+    dma_free_coherent(&pdev->dev, CQ_SIZE(QUEUE_DEPTH), (void *)pnvme_dev ->padminQ->cqes, pnvme_dev ->padminQ->cq_dma_addr);
+
+    kfree(pnvme_dev ->pioQ);
+    kfree(pnvme_dev ->padminQ);
+
+    pci_release_mem_regions(pdev);
     pci_disable_device(pdev);
+    device_destroy(nvme_class, pnvme_dev -> devt );
     cdev_del(&pnvme_dev->cdev); 
-    device_destroy(nvme_class, pnvme_dev->devt );
-    ida_simple_remove(&nvme_instance_ida, pnvme_dev->instance );
+    ida_simple_remove(&nvme_instance_ida, pnvme_dev -> instance );
     kfree(pnvme_dev);
 
 }
 
-
-// PCをシャットダウンしたときに呼ばれる
 static void nvme_shutdown(struct pci_dev *pdev)
 {
     unsigned long timeout;
@@ -677,8 +1028,7 @@ static void nvme_shutdown(struct pci_dev *pdev)
 		msleep(100);
 
 		if (time_after(jiffies, timeout)) {
-			dev_err(&pnvme_dev->pdev->dev,
-				"Device shutdown incomplete; abort shutdown\n");
+			dev_err(&pnvme_dev->pdev->dev, "Device shutdown incomplete; abort shutdown\n");
 			//			return -ENODEV;
 			return;
 		}
