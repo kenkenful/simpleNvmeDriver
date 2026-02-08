@@ -131,52 +131,37 @@ static int submitCmd(struct nvme_command *c, struct nvme_queue *q)
     u16 mycid;
     long left;
 
-    /* 並列を許さない前提でも、最低限の順序保証 */
     WRITE_ONCE(q->wait_condition, 0);
 
     spin_lock(&q->q_lock);
 
     tail = q->sq_tail;
 
-    /* CID を発行（16bitで回るので u16 推奨） */
     mycid = (u16)q->command_id++;
     c->common.command_id = cpu_to_le16(mycid);
 
-    /* SQE をメモリに書く */
     memcpy(&q->sq_cmds[tail], c, sizeof(*c));
 
     /* デバイスが読む前に SQE 書き込みを完了させる */
     wmb();
 
-    /* tail 更新 */
-    if (++tail == q->q_depth)
-        tail = 0;
+    if (++tail == q->q_depth) tail = 0;
     q->sq_tail = tail;
 
-    /* ドアベルを叩く（DSTRD対応） */
     nvme_write_sq_db(dev, q->qid, tail);
 
     spin_unlock(&q->q_lock);
 
-    /*
-     * 完了待ち：
-     * いまの実装は「何か完了したら起きる」方式。
-     * 本当は CID で待つべきだが、まずは現状維持で安全化。
-     */
     left = wait_event_interruptible_timeout(
         q->wq,
         READ_ONCE(q->wait_condition) == 1,
         msecs_to_jiffies(5000)
     );
 
-    if (left > 0)
-        return 0;
-    if (left == 0)
-        return -ETIMEDOUT;
-    return (int)left; /* -ERESTARTSYS 等 */
+    if (left > 0) return 0;
+    if (left == 0) return -ETIMEDOUT;
+    return (int)left; 
 }
-
-
 
 #endif
 
